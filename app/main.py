@@ -20,6 +20,7 @@ from .models import (
     AnnouncementItem,
     Chain,
     OrphanAnnouncement,
+    PageCacheItem,
     QueryResponse,
     SyncRequest,
     SyncResponse,
@@ -149,9 +150,34 @@ def list_sync_runs(limit: int = 20) -> dict:
     conn = db.connect()
     rows = conn.execute(
         "SELECT run_id, list_url, started_at, finished_at, status, "
-        "total_listed, fetched_ok, failed_count, kept_last, message "
-        "FROM sync_runs ORDER BY id DESC LIMIT ?",
+        "total_listed, fetched_ok, failed_count, kept_last, not_modified, "
+        "message FROM sync_runs ORDER BY id DESC LIMIT ?",
         (limit,),
     ).fetchall()
     conn.close()
     return {"runs": [dict(r) for r in rows]}
+
+
+@app.get("/api/v1/page-cache", response_model=dict[str, list[PageCacheItem]])
+def list_page_cache() -> dict:
+    """查看各 URL 的缓存条目与条件请求校验值（不含正文，避免响应过大）。"""
+    conn = db.connect()
+    db.init_db(conn)
+    rows = conn.execute(
+        "SELECT url, page_kind, etag, last_modified, fetched_at, "
+        "last_used_at, content FROM page_cache ORDER BY page_kind, url"
+    ).fetchall()
+    conn.close()
+    items = [
+        PageCacheItem(
+            url=r["url"],
+            page_kind=r["page_kind"],
+            etag=r["etag"],
+            last_modified=r["last_modified"],
+            fetched_at=r["fetched_at"],
+            last_used_at=r["last_used_at"],
+            content_length=len(r["content"].encode("utf-8")),
+        )
+        for r in rows
+    ]
+    return {"entries": items}

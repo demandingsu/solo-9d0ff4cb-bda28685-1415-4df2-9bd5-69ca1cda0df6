@@ -28,8 +28,9 @@ def site_base_url() -> str:
     port = httpd.server_address[1]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    # 每个测试会话从正常状态开始
+    # 每个测试会话从正常/初始内容状态开始
     sample_server.FAIL_ENABLED["H-001"] = False
+    sample_server.CONTENT_VERSION["I-001"] = 1
     yield f"http://127.0.0.1:{port}"
     httpd.shutdown()
     httpd.server_close()
@@ -43,10 +44,17 @@ def client(tmp_path, monkeypatch):
 
     import app.config as config
     import app.db as db
+    import app.fetcher as fetcher
+    import app.chains as chains
+    import app.service as service
     import app.main as main
 
+    # 按依赖顺序 reload，保证 service 等模块持有的是新的 config/db 单例
     importlib.reload(config)
     importlib.reload(db)
+    importlib.reload(fetcher)
+    importlib.reload(chains)
+    importlib.reload(service)
     importlib.reload(main)
 
     from fastapi.testclient import TestClient
@@ -67,5 +75,21 @@ def _fail_toggle(base_url: str, enabled: bool) -> None:
 def set_fail(site_base_url):
     def _set(enabled: bool) -> None:
         _fail_toggle(site_base_url, enabled)
+
+    return _set
+
+
+def _content_toggle(base_url: str, version: int) -> None:
+    conn = HTTPConnection("127.0.0.1", base_url.rsplit(":", 1)[1])
+    conn.request("GET", f"/content-toggle?version={version}")
+    resp = conn.getresponse()
+    resp.read()
+    conn.close()
+
+
+@pytest.fixture()
+def set_content(site_base_url):
+    def _set(version: int) -> None:
+        _content_toggle(site_base_url, version)
 
     return _set

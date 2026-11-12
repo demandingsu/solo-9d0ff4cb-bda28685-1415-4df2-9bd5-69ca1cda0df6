@@ -5,8 +5,12 @@
 归并首次公告、更正公告与撤销公告，自动识别缺失引用、引用成环、并行更正等冲突，
 并输出每条链的状态、有效截止时间与来源链接。
 
+按页面 URL 缓存成功解析的页面原文及 `ETag` / `Last-Modified`，后续同步发送
+条件请求（`If-None-Match` / `If-Modified-Since`），对未变更页面只发轻量
+304 请求并复用本地缓存，避免重复下载未变公告。
+
 技术栈：FastAPI + BeautifulSoup4 + SQLite，Docker Compose 同时启动采集 API
-与一个内置的示例公告站。
+与一个内置的示例公告站（支持 304 与同址内容更新场景）。
 
 ## 目录结构
 
@@ -14,17 +18,17 @@
 .
 ├── app/                    # 采集 API
 │   ├── config.py           # 环境变量配置
-│   ├── db.py               # SQLite 连接与表结构
-│   ├── fetcher.py          # HTTP 抓取（超时 + 有限重试）
+│   ├── db.py               # SQLite 连接与表结构（含 page_cache）
+│   ├── fetcher.py          # HTTP 抓取（超时 + 重试 + 条件请求）
 │   ├── parser.py           # 列表页/详情页解析（BeautifulSoup）
 │   ├── chains.py           # 引用链归并、冲突识别、有效截止时间计算
-│   ├── service.py          # 同步编排与持久化（含失败保留上次结果）
+│   ├── service.py          # 同步编排、页面缓存与成套事务提交
 │   ├── models.py           # 请求/响应模型
 │   └── main.py             # FastAPI 路由
 ├── sample_site/            # 示例公告站（仅 Python 标准库）
 │   ├── server.py
 │   └── Dockerfile
-├── tests/                  # pytest 测试（19 个用例）
+├── tests/                  # pytest 测试
 ├── Dockerfile              # API 镜像
 ├── docker-compose.yml      # api + sample-site 两个服务
 └── requirements.txt
@@ -80,7 +84,11 @@ pytest -q
 | POST | `/api/v1/sync` | 同步指定列表页及其全部详情页，请求体 `{"list_url": "..."}` |
 | GET | `/api/v1/chains` | 返回全部引用链 `chains` 与孤立异常公告 `orphans` |
 | GET | `/api/v1/announcements/{notice_no}` | 查询单条公告（含抓取错误、链状态） |
-| GET | `/api/v1/sync-runs?limit=20` | 同步执行记录 |
+| GET | `/api/v1/sync-runs?limit=20` | 同步执行记录（含 `not_modified` 304 复用计数） |
+| GET | `/api/v1/page-cache` | 查看各 URL 的缓存条目与 ETag/Last-Modified（不含正文） |
+
+`/api/v1/sync` 响应在原有字段基础上增加 `not_modified`：本次同步中收到
+304 并复用本地缓存的页面数（列表页与详情页合计）。
 
 `/api/v1/chains` 响应示例（节选）：
 
@@ -148,12 +156,27 @@ pytest -q
 无法归入任何链的公告进入 `orphans`，每条都带状态、冲突原因、来源链接，
 且有效截止时间为 `null`。
 
+### 条件请求与页面缓存
+
+- 按页面 URL 在 `page_cache` 表缓存**成功解析**的列表页/详情页原文，以及最近一次
+  200 响应的 `ETag`、`Last-Modified`；下次同步对该 URL 携带
+  `If-None-Match` / `If-Modified-Since` 发送条件请求。
+- 源站返回 **304** 时不下载正文，仅复用该 URL 的有效缓存并刷新 `last_used_at`；
+  若 304 到达时本地没有可复用缓存（或缓存正文不可用），自动退回**无条件重取**，
+  无条件重取仍失败则该 URL 报告失败。
+- **列表页返回 304 仍会逐条检查其中的详情页**：详情 URL 不变但内容更新
+  （同址更新）时，详情的条件请求会拿到 200 与新校验值，从而被正常发现并更新。
+- 新的 **200 页面只有解析成功后才能替换缓存**；解析失败保留旧缓存与旧公告，
+  同步标记 `partial`。
+- 缓存写入、公告更新与链归并在**同一事务内成套提交**：链归并或任何未预期错误
+  都会整体回滚，旧缓存与旧链完整保留。
+
 ### 详情抓取失败的容错
 
-- 列表页抓取失败：本次同步标记 `failed`，不动库内现有数据。
+- 列表页抓取失败：本次同步标记 `failed`，事务回滚，不动库内现有数据与缓存。
 - 单条详情页抓取/解析失败：
-  - 此前成功过 → **保留上次完整结果**，仅记录 `last_fetch_error` 与同步时间，
-    同步状态为 `partial`，响应中 `kept_last` 计数；
+  - 此前成功过 → **保留上次完整结果与旧缓存**，仅记录 `last_fetch_error` 与
+    同步时间，同步状态为 `partial`，响应中 `kept_last` 计数；
   - 从未成功 → 写入占位记录并归入孤立异常，避免静默丢失。
 - 每次同步后基于库内现有数据全量重算链状态。
 
@@ -168,14 +191,38 @@ pytest -q
 | E-001 / E-002 | 互相引用成环 | 孤立，reference_cycle |
 | F-001 | 更正公告无引用编号 | 孤立，missing_reference |
 | G-001 / G-101（+G-102） | 同项目两个独立首次公告 | 两条独立链 |
-| H-001 | 可切换 500 故障 | 验证失败保留上次结果 |
+| H-001 | 可切换 500 故障 | 验证失败保留上次结果与旧缓存 |
+| I-001 | URL 不变、内容可切换版本（同址更新） | 列表 304 时仍能发现详情更新并替换缓存 |
 
-故障开关（仅示例站）：
+示例站所有页面均携带 `ETag` 与 `Last-Modified` 并响应条件请求，校验值命中时
+返回 304（无正文），内容变化后校验值随之变化并返回 200。
+
+故障/内容开关（仅示例站）：
 
 ```bash
-curl "http://localhost:8080/fail-toggle?enabled=1"   # 开启 H-001 详情 500
-curl "http://localhost:8080/fail-toggle?enabled=0"   # 恢复
+curl "http://localhost:8080/fail-toggle?enabled=1"      # 开启 H-001 详情 500
+curl "http://localhost:8080/fail-toggle?enabled=0"      # 恢复
 curl "http://localhost:8080/fail-status"
+curl "http://localhost:8080/content-toggle?version=2"   # I-001 切换到同址更新版本
+curl "http://localhost:8080/content-toggle?version=1"   # 恢复原始版本
+curl "http://localhost:8080/content-status"
+```
+
+### 条件请求演示
+
+```bash
+# 首次同步：全部 200，建立缓存（not_modified=0）
+curl -X POST http://localhost:8000/api/v1/sync \
+  -H 'Content-Type: application/json' \
+  -d '{"list_url": "http://sample-site:8080/announcements"}'
+
+# 再次同步：页面未变，列表 + 18 个详情全部 304 复用（not_modified=19）
+curl -X POST http://localhost:8000/api/v1/sync \
+  -H 'Content-Type: application/json' \
+  -d '{"list_url": "http://sample-site:8080/announcements"}'
+
+# 查看缓存条目与校验值
+curl http://localhost:8000/api/v1/page-cache
 ```
 
 ## 配置项（环境变量）

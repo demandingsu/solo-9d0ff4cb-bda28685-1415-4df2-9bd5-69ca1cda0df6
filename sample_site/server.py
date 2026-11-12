@@ -1,6 +1,6 @@
 """示例公共采购公告站（仅依赖 Python 标准库）。
 
-用于在本地/容器内演示采集 API，覆盖以下场景：
+用于在本地/容器内演示采集 API 的条件请求与缓存能力，覆盖以下场景：
   链 A：首次 + 更正（含截止时间继承）
   链 B：首次 + 更正 + 撤销（撤销使链失效）
   链 C：并行更正（同一公告有两个后继 -> 冲突）
@@ -9,14 +9,24 @@
   链 F：更正无引用编号（missing_reference -> 孤立）
   链 G：同一项目两个独立首次公告（保持两条独立链）
   公告 H：可通过 /fail-toggle 控制详情页返回 500，验证失败保留上次结果
+  公告 I：URL 不变、内容可通过 /content-toggle 切换版本，验证
+          “列表页 304 仍检查详情，发现同址内容更新”
+
+所有页面都携带 ETag 与 Last-Modified，并响应条件请求：
+  If-None-Match / If-Modified-Since 命中 -> 304（无正文）
+  校验值不命中 -> 200（新正文 + 新 ETag/Last-Modified）
 
 控制接口：
-  GET /fail-toggle?enabled=1|0   开关 H-001 详情页的 500 故障
-  GET /fail-status               查询当前故障开关
+  GET /fail-toggle?enabled=1|0      开关 H-001 详情页的 500 故障
+  GET /fail-status                  查询 H-001 故障开关
+  GET /content-toggle?version=1|2   切换 I-001 同址内容版本
+  GET /content-status               查询 I-001 当前内容版本
 """
 from __future__ import annotations
 
+import hashlib
 import os
+from email.utils import parsedate_to_datetime
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -89,12 +99,21 @@ NOTICES: list[dict] = [
     {"no": "H-001", "project": "PRJ-H", "type": "首次公告",
      "publish": "2026-10-30 09:00:00", "deadline": "2026-11-30 09:30:00",
      "ref": ""},
+
+    # I：同址内容更新目标。URL 始终是 /notice/I-001，
+    # 截止时间等字段随 /content-toggle 切换版本（模拟更正后重新发布）
+    {"no": "I-001", "project": "PRJ-I", "type": "首次公告",
+     "publish": "2026-11-02 09:00:00",
+     "deadline": "2026-12-05 09:30:00", "ref": "",
+     "deadline_v2": "2026-12-12 15:00:00"},
 ]
 
 NOTICE_BY_NO = {n["no"]: n for n in NOTICES}
 
-# 运行期故障开关（内存态，重启容器即恢复）
+# 运行期开关（内存态，重启容器即恢复默认）
 FAIL_ENABLED = {"H-001": False}
+# I-001 当前内容版本：1=原始截止时间，2=同址更新后的截止时间
+CONTENT_VERSION = {"I-001": 1}
 
 PAGE_CSS = """
 body { font-family: sans-serif; margin: 2em; color: #222; }
@@ -136,8 +155,16 @@ def _row(label: str, value: str) -> str:
     )
 
 
+def _effective_notice(no: str) -> dict:
+    """返回公告当前应展示的字段（应用同址内容版本覆盖）。"""
+    n = dict(NOTICE_BY_NO[no])
+    if no == "I-001" and CONTENT_VERSION["I-001"] == 2:
+        n["deadline"] = n["deadline_v2"]
+    return n
+
+
 def render_detail(no: str) -> str:
-    n = NOTICE_BY_NO[no]
+    n = _effective_notice(no)
     rows = "".join([
         _row("公告编号", n["no"]),
         _row("项目编号", n["project"]),
@@ -156,6 +183,24 @@ def render_detail(no: str) -> str:
 </body></html>"""
 
 
+def _validators(body: str) -> tuple[str, str]:
+    """由正文派生强 ETag；Last-Modified 取进程内固定基准时间 + ETag 秒偏移。
+
+    真实站点一般由文件/记录的修改时间产生；示例站用 ETag 派生一个
+    可复现的 HTTP 日期即可，重点是内容变化时两个校验值都变化。
+    """
+    etag = '"' + hashlib.sha256(body.encode("utf-8")).hexdigest()[:16] + '"'
+    # 用 ETag 哈希确定一个 2026 年内的“修改时间”，保证同内容时间稳定、
+    # 不同内容时间不同。
+    offset = int(hashlib.sha1(body.encode("utf-8")).hexdigest()[:8], 16)
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    last_modified = (base + timedelta(seconds=offset % (300 * 86400))
+                     ).strftime("%a, %d %b %Y %H:%M:%S GMT")
+    return etag, last_modified
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, body: str, status: int = 200,
               content_type: str = "text/html; charset=utf-8") -> None:
@@ -166,13 +211,47 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _send_cacheable(self, body: str) -> None:
+        """发送带 ETag/Last-Modified 的页面，命中条件请求时返回 304。"""
+        etag, last_modified = _validators(body)
+        inm = self.headers.get("If-None-Match")
+        ims = self.headers.get("If-Modified-Since")
+
+        etag_match = bool(inm) and inm.strip() == etag
+        ims_match = False
+        if ims:
+            try:
+                ims_dt = parsedate_to_datetime(ims)
+                lm_dt = parsedate_to_datetime(last_modified)
+                ims_match = bool(ims_dt and lm_dt and lm_dt <= ims_dt)
+            except (TypeError, ValueError):
+                ims_match = False
+
+        # RFC 7232：同时存在两个条件头时以 If-None-Match 为准
+        if (inm and etag_match) or (not inm and ims and ims_match):
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", last_modified)
+            self.end_headers()
+            return
+
+        payload = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified", last_modified)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
         query = parse_qs(parsed.query)
 
         if path in ("/", "/announcements"):
-            self._send(render_list())
+            self._send_cacheable(render_list())
             return
 
         if path == "/fail-toggle":
@@ -192,6 +271,22 @@ class Handler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/content-toggle":
+            version = query.get("version", ["1"])[0]
+            CONTENT_VERSION["I-001"] = 2 if version in {"2", "v2"} else 1
+            self._send(
+                f'{{"I-001_version": {CONTENT_VERSION["I-001"]}}}',
+                content_type="application/json; charset=utf-8",
+            )
+            return
+
+        if path == "/content-status":
+            self._send(
+                f'{{"I-001_version": {CONTENT_VERSION["I-001"]}}}',
+                content_type="application/json; charset=utf-8",
+            )
+            return
+
         if path.startswith("/notice/"):
             no = path.rsplit("/", 1)[-1]
             notice = NOTICE_BY_NO.get(no)
@@ -201,7 +296,7 @@ class Handler(BaseHTTPRequestHandler):
             if FAIL_ENABLED.get(no):
                 self._send("<h1>500 服务器内部错误（模拟故障）</h1>", status=500)
                 return
-            self._send(render_detail(no))
+            self._send_cacheable(render_detail(no))
             return
 
         self._send("<h1>404</h1>", status=404)

@@ -39,9 +39,32 @@ CREATE TABLE IF NOT EXISTS sync_runs (
     fetched_ok      INTEGER NOT NULL DEFAULT 0,
     failed_count    INTEGER NOT NULL DEFAULT 0,
     kept_last       INTEGER NOT NULL DEFAULT 0,
+    not_modified    INTEGER NOT NULL DEFAULT 0,     -- 收到 304 复用缓存的页面数
     message         TEXT
 );
+
+-- 按页面 URL 缓存成功解析过的原文与条件请求校验值。
+-- 仅在页面解析成功后写入；304 复用期间记录保持不变。
+CREATE TABLE IF NOT EXISTS page_cache (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    url             TEXT NOT NULL UNIQUE,
+    page_kind       TEXT NOT NULL,                  -- list / detail
+    content         TEXT NOT NULL,                  -- 最近一次解析成功的页面原文
+    etag            TEXT,                           -- 最近一次 200 响应的 ETag
+    last_modified   TEXT,                           -- 最近一次 200 响应的 Last-Modified
+    fetched_at      TEXT NOT NULL,                  -- 缓存写入/刷新时间
+    last_used_at    TEXT                            -- 最近一次 304 复用时间
+);
 """
+
+# 旧版本库平滑升级：sync_runs 缺少 not_modified 列时补上
+_MIGRATIONS = (
+    (
+        "SELECT 1 FROM pragma_table_info('sync_runs') WHERE name = 'not_modified'",
+        "ALTER TABLE sync_runs ADD COLUMN not_modified "
+        "INTEGER NOT NULL DEFAULT 0",
+    ),
+)
 
 
 def get_db_path() -> Path:
@@ -59,4 +82,7 @@ def connect() -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    for check_sql, migration_sql in _MIGRATIONS:
+        if not conn.execute(check_sql).fetchone():
+            conn.execute(migration_sql)
     conn.commit()

@@ -36,8 +36,12 @@ ENTRY_AFTER_REVOCATION = "entry_after_revocation"
 UNREACHABLE = "unreachable"
 
 
-def recompute(conn: sqlite3.Connection) -> None:
-    """依据库内全部公告重新计算链归属、状态与有效截止时间，并落库。"""
+def recompute(conn: sqlite3.Connection, commit: bool = True) -> None:
+    """依据库内全部公告重新计算链归属、状态与有效截止时间，并落库。
+
+    ``commit=False`` 时只写不提交，由调用方把链归并与缓存/公告更新放进
+    同一事务成套提交；归并抛错则整体回滚，旧链与旧缓存均保留。
+    """
     rows = conn.execute(
         "SELECT * FROM announcements ORDER BY id"
     ).fetchall()
@@ -159,7 +163,8 @@ def recompute(conn: sqlite3.Connection) -> None:
             "conflict_reasons = ?, effective_deadline = NULL WHERE notice_no = ?",
             (json.dumps(per_notice, ensure_ascii=False) if per_notice else None, no),
         )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def _mark_cycles(

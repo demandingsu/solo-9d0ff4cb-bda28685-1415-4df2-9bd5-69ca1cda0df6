@@ -55,4 +55,17 @@ class SyncResponse(BaseModel):
     fetched_ok: int
     failed_count: int
     kept_last: int
+    not_modified: int = Field(
+        0, description="本次同步中收到 304 并复用本地缓存的页面数"
+    )
     message: Optional[str] = None
+
+
+class PageCacheItem(BaseModel):
+    url: str
+    page_kind: str = Field(..., description="list / detail")
+    etag: Optional[str] = None
+    last_modified: Optional[str] = None
+    fetched_at: str
+    last_used_at: Optional[str] = None
+    content_length: int = Field(..., description="缓存原文字节长度")
